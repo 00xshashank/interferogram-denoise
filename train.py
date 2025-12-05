@@ -1,14 +1,15 @@
-from PIL import Image
-import numpy as np
-import matplotlib.pyplot as plt
-
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
+import torch.optim.lr_scheduler as scheduler
+
+from pytorch_msssim import SSIM
 
 from model import UNet
 from dataloaders import TrainLoader, ValLoader, TestLoader
+
+torch.multiprocessing.set_sharing_strategy('file_system')
 
 def calculate_snr(output: torch.tensor, target: torch.tensor):
     output_flat = output.view(output.shape[0], -1)
@@ -35,45 +36,50 @@ if __name__ == "__main__":
 
     modelg = model.to(device=device)
 
-    print(" ===== MODEL SUMMARY ===== ")
-    print(modelg)
-
     total_trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f"Trainable parameters: {total_trainable}")
 
-    PATH = r"models\\model1.pth"
+    print(" === MODEL SUMMARY === ")
+    print(modelg)
+
+    PATH = r"models\\attempt1\\model1.pth"
 
     def train():
         num_train = len(TrainLoader)
         num_val = len(ValLoader)
+        num_test = len(TestLoader)
         num_epochs = 10
         optimizer = optim.Adam(model.parameters(), lr=3e-4)
-        CELoss = nn.MSELoss()
+        LRScheduler = scheduler.ReduceLROnPlateau(optimizer, 'min', 0.5, patience=0)
+        MSELoss = nn.MSELoss()
+        SSIMLoss = SSIM(win_size=7, data_range=1.0, size_average=True, channel=1)
 
-        train_losses = []
         for epoch in range(num_epochs):
-            print(f" ====== EPOCH {epoch} ====== ")
-            
-            epoch_loss = 0.0
+            print(f" === EPOCH {epoch} === ")
+            mse_loss = 0.0
             avg_snr = 0.0
+            epoch_mse_train = 0.0
 
             modelg.train()
             for noisy, clean in TrainLoader:
                 noisy=noisy.to(device)
                 clean=clean.to(device)
                 modelout = modelg(noisy)
-                loss = CELoss(modelout, clean)
-                epoch_loss += loss.item()
+                mse_loss = MSELoss(modelout, clean)
                 avg_snr += calculate_snr(modelout, clean)
 
                 optimizer.zero_grad()
-                loss.backward()
+                mse_loss.backward()
                 optimizer.step()
 
-            print(f"Train Loss: {epoch_loss / num_train}")
+                epoch_mse_train += mse_loss.item()
+
+            print(f"Train MSE loss: {epoch_mse_train / num_train}")
             print(f"Average SNR over train set: {avg_snr / num_train}")
 
-            epoch_val_loss = 0.0
+            print("\n")
+
+            epoch_val_mse = 0.0
             epoch_val_snr = 0.0
             modelg.eval()
             with torch.no_grad():
@@ -81,19 +87,39 @@ if __name__ == "__main__":
                     noisy=noisy.to(device)
                     clean=clean.to(device)
                     modelout = modelg(noisy)
-                    loss = CELoss(modelout, clean)
-                    epoch_val_loss += loss.item()
+                    epoch_val_mse = MSELoss(modelout, clean).item()
                     epoch_val_snr += calculate_snr(modelout, clean)
             
-                print(f"Val Loss: {epoch_val_loss / num_val}")
+                print(f"Val MSE Loss: {epoch_val_mse / num_val}")
                 print(f"Average SNR over validation set: {epoch_val_snr / num_val}")
 
             print("\n")
+            LRScheduler.step(epoch_val_mse / num_val)
             # break
 
         torch.save(model.state_dict(), PATH)
-            
-        # plt.plot(train_losses)
-        # plt.show()
+
+        epoch_test_mse = []
+        mse_loss = 0.0
+        epoch_test_snr = 0.0
+        epoch_test_ssim = []
+        ssim_loss = 0.0
+        epoch_test_loss = 0.0
+        modelg.eval()
+        with torch.no_grad():
+            for noisy, clean in TestLoader:
+                noisy=noisy.to(device)
+                clean=clean.to(device)
+                modelout = modelg(noisy)
+                mse_loss = MSELoss(modelout, clean).item()
+                epoch_test_mse.append(mse_loss)
+                ssim_loss = 1 - SSIMLoss(modelout, clean)
+                epoch_test_ssim.append(ssim_loss)
+                epoch_test_snr += calculate_snr(modelout, clean)
+                epoch_test_loss += mse_loss + ssim_loss
+        
+            print(f"Test MSE Loss: {torch.sum(torch.tensor(epoch_test_mse)) / num_test}")
+            print(f"Test SSIM Loss: {torch.sum(torch.tensor(epoch_test_ssim)) / num_test}")
+            print(f"Average SNR over test set: {epoch_test_snr / num_test}")
 
     train()
